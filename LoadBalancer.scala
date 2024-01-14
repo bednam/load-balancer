@@ -17,37 +17,73 @@ import org.http4s.client.Client
 import org.http4s.*
 import org.http4s.implicits.*
 import org.typelevel.log4cats.slf4j.Slf4jLogger
+import scala.concurrent.duration.*
 
-object LoadBalancer extends IOApp.Simple with Http4sDsl[IO]:
+object LoadBalancer extends IOApp with Http4sDsl[IO]:
 
   val logger = Slf4jLogger.getLogger[IO]
 
-  val serverURIs =
-    List(uri"http://localhost:8081", uri"http://localhost:8082")
-
-  def routes(client: Client[IO], uris: std.Queue[IO, Uri]): HttpRoutes[IO] =
+  def routes(
+      client: Client[IO],
+      urisRef: Ref[IO, std.Queue[IO, Uri]]
+  ): HttpRoutes[IO] =
     HttpRoutes.of[IO] { case req @ GET -> Root =>
       for {
-        nextUri <- uris.take
-        _ <- uris.offer(nextUri)
+        urisQueue <- urisRef.get
+        nextUri <- urisQueue.take
+        _ <- urisQueue.offer(nextUri)
         _ <- logger.info(s"Forwarding request to server $nextUri")
         res <- client.expect[String](req.withUri(nextUri)).flatMap(Ok(_))
       } yield res
     }
 
-  def run: IO[Unit] =
+  private def healthCheck(
+      client: Client[IO],
+      uris: List[Uri],
+      urisRef: Ref[IO, std.Queue[IO, Uri]]
+  ): IO[Unit] = {
+    case class UriStatus(uri: Uri, healthy: Boolean)
+    for {
+      statuses <- uris
+        .parTraverse { uri =>
+          client
+            .status(Request(uri = uri))
+            .map(status => UriStatus(uri, status.isSuccess))
+            .handleError(_ => UriStatus(uri, healthy = false))
+            .flatTap(status =>
+              if (status.healthy) logger.info(s"${status.uri} healthcheck ok")                
+              else logger.warn(s"${status.uri} doesn't respond") 
+            )
+        }
+      healthyUris = statuses.filter(_.healthy).map(_.uri)
+      healthyQueue <- std.Queue.bounded[IO, Uri](uris.size)
+      _ <- healthyUris.traverse(healthyQueue.offer)
+      _ <- urisRef.set(healthyQueue)
+    } yield ()
+  }
+
+  def run(args: List[String]): IO[ExitCode] = {
+    val serverUris =
+      args.map(port => s"http://localhost:$port").map(Uri.unsafeFromString)
+
     EmberClientBuilder.default[IO].build.use { client =>
       for {
-        uris <- std.Queue.unbounded[IO, Uri]
-        _ <- serverURIs.traverse(uris.offer)
+        urisRef <- std.Queue.bounded[IO, Uri](serverUris.size).flatMap(Ref.of)
+        _ <- urisRef.get.flatTap(queue => serverUris.traverse(queue.offer))
+        _ <- (IO.sleep(10.seconds) *> healthCheck(
+          client,
+          serverUris,
+          urisRef
+        )).foreverM.start
         _ <- EmberServerBuilder
           .default[IO]
           .withHost(ipv4"0.0.0.0")
           .withPort(port"80")
           .withHttpApp(
-            Logger.httpApp(true, true)(routes(client, uris).orNotFound)
+            Logger.httpApp(true, true)(routes(client, urisRef).orNotFound)
           )
           .build
           .useForever
-      } yield ()
+      } yield ExitCode.Success
     }
+  }

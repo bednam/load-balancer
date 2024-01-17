@@ -63,8 +63,10 @@ object LoadBalancer extends IOApp with Http4sDsl[IO]:
   }
 
   def run(args: List[String]): IO[ExitCode] = {
+    val gateway = sys.env.getOrElse("GATEWAY_ADDRESS", "127.0.0.1")
+    println(s"GATEWAY_ADDRESS: $gateway")
     val serverUris =
-      args.map(port => s"http://localhost:$port").map(Uri.unsafeFromString)
+      args.map(port => s"http://$gateway:$port").map(Uri.unsafeFromString)
 
     EmberClientBuilder.default[IO].build.use { client =>
       for {
